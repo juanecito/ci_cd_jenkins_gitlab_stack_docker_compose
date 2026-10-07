@@ -1,0 +1,9 @@
+# Copyright (c) 2026 Juan Maria Gomez Lopez <juan-maria.gomez-lopez@tutamail.com>
+# SPDX-License-Identifier: MIT
+
+# Secrets: .env, its backups and temp files written by generate-env.sh
+.env
+.env.*
+
+# Personal Claude Code settings
+.claude/settings.local.json

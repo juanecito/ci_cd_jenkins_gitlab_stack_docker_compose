@@ -1,0 +1,24 @@
+# Copyright (c) 2026 Juan Maria Gomez Lopez <juan-maria.gomez-lopez@tutamail.com>
+# SPDX-License-Identifier: MIT
+
+git
+git-client
+structs
+workflow-step-api
+workflow-scm-step
+scm-api
+icon-shim
+authentication-tokens
+durable-task
+ruby-runtime
+jquery
+nodejs
+docker-commons
+docker-plugin
+docker-build-step
+docker-slaves
+gitlab-oauth
+gitlab-hook
+gitlab-logo
+gitlab-plugin
+sonar
