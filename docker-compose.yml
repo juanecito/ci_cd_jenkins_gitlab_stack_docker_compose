@@ -1,11 +1,47 @@
 # Copyright (c) 2026 Juan Maria Gomez Lopez <juan-maria.gomez-lopez@tutamail.com>
 # SPDX-License-Identifier: MIT
 
+# Shared settings, merged into services with `<<: *name`. A merge is shallow: a
+# service that sets its own `environment:` must merge the shared one inside it.
+
+# Every long-running service: restart policy and the shared network
+x-service: &service
+  restart: unless-stopped
+  networks:
+    - ci_net
+
+x-tz-env: &tz-env
+  TZ: "${TZ:-UTC}"
+
+x-runner-image: &runner-image gitlab/gitlab-runner:latest
+
+# C/C++ Jenkins agents: one image per Debian release, built from
+# agent_jenkins_cpp_<release>/ plus the shared agent_jenkins_common/ context
+x-cpp-agent-build: &cpp-agent-build
+  additional_contexts:
+    common: ./agent_jenkins_common
+  args:
+    AGENT_UID: 1002
+    AGENT_GID: 1002
+
+x-cpp-agent-env: &cpp-agent-env
+  <<: *tz-env
+  JENKINS_URL: http://jenkins:8080
+  JENKINS_AGENT_WORKDIR: /home/jenkins/agent
+  JAVA_OPTS: -Xmx512m
+
+x-cpp-agent: &cpp-agent
+  <<: *service
+  init: true   # tini as PID 1: reaps zombie build processes and forwards signals
+  depends_on: [jenkins]
+  group_add:
+    - "${DOCKER_GID}"   # GID of the host Docker socket, so the agent can run docker
+
 services:
   gitlab:
+    <<: *service
     image: gitlab/gitlab-ce:latest
     container_name: gitlab
-    restart: unless-stopped
     hostname: gitlab.local
     shm_size: "256m"
     environment:
@@ -25,8 +61,6 @@ services:
       - gitlab_config:/etc/gitlab
       - gitlab_logs:/var/log/gitlab
       - gitlab_data:/var/opt/gitlab
-    networks:
-      - ci_net
     healthcheck:
       test: ["CMD", "/opt/gitlab/bin/gitlab-healthcheck", "--fail", "--max-time", "10"]
       interval: 60s
@@ -35,37 +69,33 @@ services:
       start_period: 5m
 
   jenkins:
+    <<: *service
     image: jenkins/jenkins:latest
     container_name: jenkins
-    restart: unless-stopped
     user: root
     environment:
+      <<: *tz-env
       JAVA_OPTS: "-Djenkins.install.runSetupWizard=true -Xmx1g"
       JENKINS_OPTS: "--httpPort=8080"
-      TZ: "${TZ:-UTC}"
     ports:
       - "127.0.0.1:8080:8080"     # Web UI
       - "127.0.0.1:50000:50000"   # Inbound agents
     volumes:
       - jenkins_home:/var/jenkins_home
       - /var/run/docker.sock:/var/run/docker.sock   # allow builds to use host Docker
-    networks:
-      - ci_net
     depends_on:
       gitlab:
         condition: service_started
 
   gitlab-runner:
-    image: gitlab/gitlab-runner:latest
+    <<: *service
+    image: *runner-image
     container_name: gitlab-runner
-    restart: unless-stopped
     environment:
-      TZ: "${TZ:-UTC}"
+      <<: *tz-env
     volumes:
       - gitlab_runner_config:/etc/gitlab-runner
       - /var/run/docker.sock:/var/run/docker.sock   # docker executor starts job containers on the host
-    networks:
-      - ci_net
     depends_on:
       gitlab:
         condition: service_healthy
@@ -75,13 +105,13 @@ services:
   # One-shot job: creates an instance runner via the GitLab API and registers it
   # in gitlab_runner_config. Does nothing if a runner is already registered.
   gitlab-runner-register:
-    image: gitlab/gitlab-runner:latest
+    <<: *service
+    image: *runner-image
     container_name: gitlab-runner-register
     restart: "no"
     entrypoint: ["/bin/bash", "/register.sh"]
     environment:
       GITLAB_URL: http://gitlab:8929
-      GITLAB_ROOT_PASSWORD: "${GITLAB_ROOT_PASSWORD}"
       RUNNER_NAME: "${RUNNER_NAME:-docker-runner}"
       RUNNER_TAGS: "${RUNNER_TAGS:-docker}"
       RUNNER_DEFAULT_IMAGE: "${RUNNER_DEFAULT_IMAGE:-alpine:latest}"
@@ -92,24 +122,20 @@ services:
       - ./runner/register.sh:/register.sh:ro
       - gitlab_runner_config:/etc/gitlab-runner
       - /var/run/docker.sock:/var/run/docker.sock   # used to run `gitlab-rails runner` inside the gitlab container and mint a bootstrap API token (GitLab dropped OAuth password-grant login)
-    networks:
-      - ci_net
     depends_on:
       gitlab:
         condition: service_healthy
 
   sonarqube_db:
+    <<: *service
     image: postgres:16
     container_name: sonarqube_db
-    restart: unless-stopped
     environment:
       POSTGRES_USER: sonar
       POSTGRES_PASSWORD: "${SONAR_DB_PASSWORD}"
       POSTGRES_DB: sonarqube
     volumes:
       - gitlab_sonarqube_db:/var/lib/postgresql/data
-    networks:
-      - ci_net
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U sonar -d sonarqube"]
       interval: 10s
@@ -117,9 +143,9 @@ services:
       retries: 5
 
   sonarqube:
+    <<: *service
     image: sonarqube:community
     container_name: sonarqube
-    restart: unless-stopped
     depends_on:
       sonarqube_db:
         condition: service_healthy
@@ -133,48 +159,67 @@ services:
       - gitlab_sonarqube_data:/opt/sonarqube/data
       - gitlab_sonarqube_extensions:/opt/sonarqube/extensions
       - gitlab_sonarqube_logs:/opt/sonarqube/logs
-    networks:
-      - ci_net
     ulimits:
       nofile:
         soft: 131072
         hard: 131072
 
   registry:
+    <<: *service
     image: registry:latest
     container_name: registry
-    restart: unless-stopped
     ports:
       - "127.0.0.1:5000:5000"
     volumes:
       - registry_data:/var/lib/registry
-    networks:
-      - ci_net
 
-  agent_jenkins_cpp:
+  agent_jenkins_cpp_trixie:
+    <<: *cpp-agent
     build:
-      context: ./agent_jenkins_cpp
-      args:
-        AGENT_UID: 1002
-        AGENT GID: 1002
+      <<: *cpp-agent-build
+      context: ./agent_jenkins_cpp_trixie
     image: local/jenkins-agent-cpp:trixie
-    container_name: agent_jenkins_cpp
-    restart: unless-stopped
-    depends_on: [jenkins]
+    container_name: agent_jenkins_cpp_trixie
     environment:
-      JENKINS_URL: http://jenkins:8080
-      JENKINS_AGENT_NAME: cpp-agent
-      JENKINS_SECRET: ${CPP_AGENT_SECRET}
-      JENKINS_AGENT_WORKDIR: /home/jenkins/agent
-      JAVA_OPTS: -Xmx512m
-    group_add:
-      - "${DOCKER_GID}"   # In order to acces socket Docker of Host
+      <<: *cpp-agent-env
+      JENKINS_AGENT_NAME: cpp-agent-trixie
+      JENKINS_SECRET: "${CPP_TRIXIE_AGENT_SECRET}"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - cpp_agent_work:/home/jenkins/agent
-      - cpp_agent_ccache:/home/jenkins/.ccache
-    networks:
-      - ci_net 
+      - cpp_agent_trixie_work:/home/jenkins/agent
+      - cpp_agent_trixie_ccache:/home/jenkins/.ccache
+
+  agent_jenkins_cpp_bullseye:
+    <<: *cpp-agent
+    build:
+      <<: *cpp-agent-build
+      context: ./agent_jenkins_cpp_bullseye
+    image: local/jenkins-agent-cpp:bullseye
+    container_name: agent_jenkins_cpp_bullseye
+    environment:
+      <<: *cpp-agent-env
+      JENKINS_AGENT_NAME: cpp-agent-bullseye
+      JENKINS_SECRET: "${CPP_BULLSEYE_AGENT_SECRET}"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - cpp_agent_bullseye_work:/home/jenkins/agent
+      - cpp_agent_bullseye_ccache:/home/jenkins/.ccache
+
+  agent_jenkins_cpp_stretch:
+    <<: *cpp-agent
+    build:
+      <<: *cpp-agent-build
+      context: ./agent_jenkins_cpp_stretch
+    image: local/jenkins-agent-cpp:stretch
+    container_name: agent_jenkins_cpp_stretch
+    environment:
+      <<: *cpp-agent-env
+      JENKINS_AGENT_NAME: cpp-agent-stretch
+      JENKINS_SECRET: "${CPP_STRETCH_AGENT_SECRET}"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - cpp_agent_stretch_work:/home/jenkins/agent
+      - cpp_agent_stretch_ccache:/home/jenkins/.ccache
 
 networks:
   ci_net:
@@ -192,5 +237,9 @@ volumes:
   gitlab_sonarqube_extensions:
   gitlab_sonarqube_logs:
   registry_data:
-  cpp_agent_work:
-  cpp_agent_ccache:
+  cpp_agent_trixie_work:
+  cpp_agent_trixie_ccache:
+  cpp_agent_bullseye_work:
+  cpp_agent_bullseye_ccache:
+  cpp_agent_stretch_work:
+  cpp_agent_stretch_ccache:
