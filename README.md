@@ -10,6 +10,9 @@ A local CI/CD environment running GitLab, Jenkins, a GitLab Runner and SonarQube
 | sonarqube | `sonarqube:community`     | Code quality analysis    |
 | sonarqube_db | `postgres:16`          | SonarQube database       |
 | registry | `registry:latest`         | Docker image registry    |
+| agent_jenkins_cpp_trixie | `local/jenkins-agent-cpp:trixie` (built here) | Jenkins C/C++ agent, Debian 13 |
+| agent_jenkins_cpp_bullseye | `local/jenkins-agent-cpp:bullseye` (built here) | Jenkins C/C++ agent, Debian 11 |
+| agent_jenkins_cpp_stretch | `local/jenkins-agent-cpp:stretch` (built here) | Jenkins C/C++ agent, Debian 9 |
 
 ```text
  browser / git client
@@ -48,7 +51,8 @@ Then open GitLab at http://localhost:8929. The runner registers itself once GitL
 - `generate-env.sh`: creates or completes `.env` (random passwords, host time zone, Docker socket GID)
 - `.gitignore`: keeps `.env` and its backups out of version control
 - `runner/register.sh`: script that registers the GitLab Runner automatically
-- `agent_jenkins_cpp/`: image for the C/C++ Jenkins agent
+- `agent_jenkins_cpp_trixie/`, `agent_jenkins_cpp_bullseye/`, `agent_jenkins_cpp_stretch/`: Dockerfiles of the C/C++ Jenkins agents (Debian 13, 11 and 9)
+- `agent_jenkins_common/`: files shared by all agent images (`entrypoint.sh`)
 - `README.md`: this documentation
 - `LICENSE`: MIT license
 
@@ -67,10 +71,12 @@ It generates random 32-character alphanumeric passwords, detects the host time z
 | `GITLAB_ROOT_PASSWORD` | Random password            | Initial password for GitLab's `root` user     |
 | `SONAR_DB_PASSWORD`    | Random password            | Password for the SonarQube Postgres database  |
 | `TZ`                   | Host time zone (or `UTC`)  | Time zone for Jenkins and GitLab Runner       |
-| `DOCKER_GID`           | GID of `/var/run/docker.sock` | Group added to `agent_jenkins_cpp` so it can use the host Docker |
-| `CPP_AGENT_SECRET`     | Left empty                 | Secret of the `cpp-agent` node in Jenkins (see [Agent Docker for Jenkins](#agent-docker-for-jenkins)) |
+| `DOCKER_GID`           | GID of `/var/run/docker.sock` | Group added to the Jenkins agents so they can use the host Docker |
+| `CPP_TRIXIE_AGENT_SECRET`   | Left empty            | Secret of the `cpp-agent-trixie` node in Jenkins (see [Jenkins C/C++ agents](#jenkins-cc-agents)) |
+| `CPP_BULLSEYE_AGENT_SECRET` | Left empty            | Secret of the `cpp-agent-bullseye` node in Jenkins |
+| `CPP_STRETCH_AGENT_SECRET`  | Left empty            | Secret of the `cpp-agent-stretch` node in Jenkins |
 
-Options: `--cpp-agent-secret <secret>` stores the Jenkins agent secret, `--new-passwords` regenerates both passwords, `-o <file>` writes somewhere else, `--help` shows all of them.
+Options: `--agent-secret <release>=<secret>` (repeatable; `<release>` is `trixie`, `bullseye` or `stretch`) stores a Jenkins agent secret, `--new-passwords` regenerates both passwords, `-o <file>` writes somewhere else, `--help` shows all of them.
 
 > GitLab and Postgres only read their passwords on first initialization. To change them later, use GitLab's UI or `gitlab-rake`, and `ALTER USER` in Postgres. `--new-passwords` on an existing stack only changes `.env`, which breaks SonarQube's database login.
 > Avoid `$` and `'` in hand-written values: Compose interpolates `$`, and `'` breaks GitLab's configuration.
@@ -155,6 +161,8 @@ git clone ssh://git@localhost:2224/<group>/<project>.git
 | `gitlab_sonarqube_logs` | `/opt/sonarqube/logs` | SonarQube logs |
 | `gitlab_sonarqube_db` | `/var/lib/postgresql/data` | SonarQube Postgres data |
 | `registry_data` | `/var/lib/registry`      | Pushed Docker images          |
+| `cpp_agent_<release>_work` | `/home/jenkins/agent` | Jenkins agent workspace (one per agent: `trixie`, `bullseye`, `stretch`) |
+| `cpp_agent_<release>_ccache` | `/home/jenkins/.ccache` | ccache compiler cache (one per agent) |
 
 The SonarQube volumes use a `gitlab_` prefix to group them with the GitLab stack, but they are separate from GitLab's own volumes. Do not mount GitLab's volumes into SonarQube, because sharing them can corrupt data.
 
@@ -361,6 +369,7 @@ curl http://localhost:5000/v2/_catalog
 - **Docker socket:** Jenkins mounts `/var/run/docker.sock` so pipelines can run Docker commands. This gives Jenkins root-equivalent control of the host's Docker. Remove that volume line if you do not need it. The Jenkins image also does not include the Docker CLI; install it in a custom image or use a Docker agent/plugin.
 - **Runner and the Docker socket:** `gitlab-runner` also mounts the host Docker socket, with the same root-equivalent risk as Jenkins. Only run trusted pipelines.
 - **Register step and the Docker socket:** `gitlab-runner-register` also mounts the host Docker socket, so it can run `gitlab-rails runner` inside the `gitlab` container to mint its own bootstrap API token. It's a one-shot container and revokes that token once the runner is registered, but the socket access itself is still root-equivalent for the duration.
+- **Jenkins agents and the Docker socket:** the three C/C++ agents mount the host Docker socket and join its group (`DOCKER_GID`), so any pipeline that runs on them has root-equivalent control of the host's Docker, even though the agents run as the unprivileged `jenkins` user.
 - **Root user:** Jenkins runs as `root` so it can use the socket. For stricter setups, run as the default `jenkins` user and add the docker group instead.
 - **Memory tuning:** GitLab is limited to 2 Puma workers, 10 Sidekiq threads and has Prometheus disabled. Raise these on larger hosts by editing `GITLAB_OMNIBUS_CONFIG`.
 - **Changing the URL:** if you serve GitLab on another host or port, update `external_url` and the port mappings together, then run `docker compose up -d`.
@@ -414,22 +423,42 @@ docker compose up -d
 
 Back up first. GitLab can only upgrade along supported version paths, so do not skip major versions; pin a tag and move one step at a time. SonarQube Community also upgrades in steps, and the database must be backed up before a major upgrade.
 
-## Agent Docker for Jenkins
+## Jenkins C/C++ agents
 
-Create Node (Nodes -> New Node -> Permanent Agent):
-- Name: cpp-agent
-- Remote root: /home/jenkins/agent
-- Labels: cpp docker
+Three inbound agents build C/C++ code on different Debian releases. They share the same toolchain (gcc, clang, cmake, ninja, Qt 5, libcurl, libpq, libapt-pkg, ccache, valgrind, cppcheck) at each release's own versions, plus the Docker CLI with Buildx and Compose.
+
+| Service                       | Jenkins node          | Base image        | Java       | Notes |
+|-------------------------------|-----------------------|-------------------|------------|-------|
+| `agent_jenkins_cpp_trixie`    | `cpp-agent-trixie`    | `debian:trixie`   | Debian `openjdk-21` | Docker CLI from Docker's apt repository |
+| `agent_jenkins_cpp_bullseye`  | `cpp-agent-bullseye`  | `debian:bullseye` | Temurin 21 (copied from `eclipse-temurin:21-jre`) | End of life: apt uses archive.debian.org |
+| `agent_jenkins_cpp_stretch`   | `cpp-agent-stretch`   | `debian:stretch`  | Temurin 21 (copied from `eclipse-temurin:21-jre`) | End of life: apt uses archive.debian.org; no `lld` package; curlpp 0.8.1 built from source (not packaged for stretch) |
+
+Jenkins' `agent.jar` needs Java 17 or newer, which stretch (Java 8) does not have, so the two older images copy the Java runtime and the static Docker CLI (`docker:29-cli`) from upstream images instead of installing them with apt. Bullseye and stretch get no more security updates; use them only to build for those releases.
+
+All agents connect to `http://jenkins:8080` over WebSocket (port 50000 is not needed), run with `init: true` so tini reaps build processes, and copy `agent_jenkins_common/entrypoint.sh` through the `common` additional build context.
+
+For each agent, create a node in Jenkins (Nodes -> New Node -> Permanent Agent):
+- Name: `cpp-agent-trixie`, `cpp-agent-bullseye` or `cpp-agent-stretch`
+- Remote root: `/home/jenkins/agent`
+- Labels: `cpp docker <release>` (for example `cpp docker stretch`), so pipelines can pick a release with `agent { label 'cpp && stretch' }`
 - Launch: Launch agent by connecting it to the controller
 
 Save the node, copy the secret shown on its page and store it in `.env`:
-- ``` ./generate-env.sh --cpp-agent-secret <secret> ```
 
-For build only this agent:
-- ``` docker compose up -d --build agent_jenkins_cpp ```
-- ``` docker logs -f agent_jenkins_cpp # must finished with "Connected" ```
+```bash
+./generate-env.sh --agent-secret trixie=<secret> --agent-secret bullseye=<secret> --agent-secret stretch=<secret>
+```
 
+Build and start the agents:
 
+```bash
+docker compose up -d --build agent_jenkins_cpp_trixie agent_jenkins_cpp_bullseye agent_jenkins_cpp_stretch
+docker compose logs -f agent_jenkins_cpp_stretch   # must end with "Connected"
+```
+
+An agent without a secret in `.env` exits with `Missing JENKINS_SECRET` and keeps restarting; start only the agents you have created nodes for.
+
+**Upgrading from the single `agent_jenkins_cpp` agent:** the service is now `agent_jenkins_cpp_trixie`, its node is `cpp-agent-trixie` and its secret is `CPP_TRIXIE_AGENT_SECRET`. Jenkins derives the secret from the node name, so rename the `cpp-agent` node in Jenkins (Configure -> Name), copy its new secret and run `./generate-env.sh --agent-secret trixie=<secret>`, which also drops the old `CPP_AGENT_SECRET`. Then remove the old container with `docker compose up -d --remove-orphans`. The old `cpp_agent_work` and `cpp_agent_ccache` volumes only hold a workspace and a compiler cache; delete them with `docker volume rm docker_gitlab_jenkins_cpp_agent_work docker_gitlab_jenkins_cpp_agent_ccache` once the new agent works.
 
 ## Troubleshooting
 
@@ -446,6 +475,8 @@ For build only this agent:
 | Runner cannot register         | Read `docker compose logs gitlab-runner-register`; if it can't reach the Docker socket or mint a root token, register manually (see the runner section) |
 | `docker: not found` in a job   | Use an image that includes the Docker CLI, such as `docker:cli`                          |
 | `push`/`pull` to `registry` fails with a TLS error | Add `registry:5000` (and `localhost:5000`) to `insecure-registries` in `/etc/docker/daemon.json` and restart Docker |
+| Agent keeps restarting with `Missing JENKINS_SECRET` | Create its node in Jenkins and run `./generate-env.sh --agent-secret <release>=<secret>` |
+| bullseye/stretch agent build fails with `404 Not Found` from apt | The release moved to archive.debian.org; check the `sources.list` lines in its Dockerfile still match the archive layout |
 | Disk fills up                  | Clean old images and job containers with `docker system prune` (add `--volumes` with care) |
 
 ## License

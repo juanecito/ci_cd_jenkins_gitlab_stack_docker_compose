@@ -9,7 +9,7 @@ ARG AGENT_GID=1002
 
 # Java (for Jenkins agent) + toolchain C/C++
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates curl gnupg git openssh-client tini \
+        ca-certificates curl gnupg git openssh-client \
         openjdk-21-jre-headless \
         build-essential gcc g++ gdb make cmake ninja-build \
         clang clang-format clang-tidy lld lldb \
@@ -61,7 +61,8 @@ RUN groupadd -g ${AGENT_GID} jenkins \
 
 # COPY --chmod=644 daemon.json /etc/docker/daemon.json
 
-COPY --chmod=0755 entrypoint.sh /usr/local/bin/entrypoint.sh
+# Shared by all agents: the "common" build context is agent_jenkins_common/ (see docker-compose.yml)
+COPY --from=common --chmod=0755 entrypoint.sh /usr/local/bin/entrypoint.sh
 
 ENV CCACHE_DIR=/home/jenkins/.ccache \
     PATH=/usr/lib/ccache:${PATH}
@@ -70,4 +71,5 @@ ENV CCACHE_DIR=/home/jenkins/.ccache \
 USER jenkins
 
 WORKDIR /home/jenkins
-ENTRYPOINT [ "/usr/bin/tini", "--", "/usr/local/bin/entrypoint.sh" ]
+# PID 1 init (tini) comes from `init: true` in docker-compose.yml
+ENTRYPOINT [ "/usr/local/bin/entrypoint.sh" ]
