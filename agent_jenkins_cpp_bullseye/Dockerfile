@@ -29,7 +29,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential gcc g++ gdb make cmake ninja-build \
         clang clang-format clang-tidy lld lldb \
         autoconf automake libtool pkg-config \
-        ccache valgrind cppcheck python3 fakeroot rsync \
+        ccache valgrind cppcheck python3 fakeroot rsync wget \
     && rm -rf /var/lib/apt/lists/*
 
 # Install qt5 base from Debian 11 repositories
