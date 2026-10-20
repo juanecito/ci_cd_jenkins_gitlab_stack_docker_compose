@@ -59,6 +59,10 @@ RUN groupadd -g ${AGENT_GID} jenkins \
     && mkdir -p /home/jenkins/agent /home/jenkins/.ccache \
     && chown -R jenkins:jenkins /home/jenkins
 
+# User jenkins can create and modify in /opt
+chgrp jenkins /opt
+chmod 2775 /opt
+
 # COPY --chmod=644 daemon.json /etc/docker/daemon.json
 
 # Shared by all agents: the "common" build context is agent_jenkins_common/ (see docker-compose.yml)

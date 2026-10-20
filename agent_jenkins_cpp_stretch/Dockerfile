@@ -81,6 +81,10 @@ RUN groupadd -g ${AGENT_GID} jenkins \
     && mkdir -p /home/jenkins/agent /home/jenkins/.ccache \
     && chown -R jenkins:jenkins /home/jenkins
 
+# User jenkins can create and modify in /opt
+chgrp jenkins /opt
+chmod 2775 /opt
+
 # Shared by all agents: the "common" build context is agent_jenkins_common/ (see docker-compose.yml)
 COPY --from=common --chmod=0755 entrypoint.sh /usr/local/bin/entrypoint.sh
 
